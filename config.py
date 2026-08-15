@@ -47,5 +47,52 @@ POMODORO_WORK_MIN = 25
 POMODORO_BREAK_MIN = 5
 POMODORO_CYCLES = 4
 
+# ---- 年組オンボーディング ----
+try:
+    ONBOARDING_CHANNEL_ID: int | None = int(os.getenv("ONBOARDING_CHANNEL_ID", "")) if os.getenv("ONBOARDING_CHANNEL_ID") else None
+except ValueError:
+    ONBOARDING_CHANNEL_ID = None
+
+# 年組ロール設定: 既定は「1年/2年/3年」「1組〜7組」のロール名で解決する。
+# 別名のロールを使いたい場合は .env でマッピングを指定:
+#   ONBOARDING_YEAR_ROLES="1年:123456,2年:234567,3年:34567"
+#   ONBOARDING_CLASS_ROLES="1組:111,2組:222,..."
+def _parse_role_map(raw: str | None) -> dict[str, int]:
+    if not raw:
+        return {}
+    out: dict[str, int] = {}
+    for p in raw.split(","):
+        p = p.strip()
+        if not p or ":" not in p:
+            continue
+        k, v = p.split(":", 1)
+        k = k.strip()
+        v = v.strip()
+        try:
+            out[k] = int(v)
+        except ValueError:
+            pass
+    return out
+
+ONBOARDING_YEAR_ROLES: dict[str, int] = _parse_role_map(os.getenv("ONBOARDING_YEAR_ROLES"))
+ONBOARDING_CLASS_ROLES: dict[str, int] = _parse_role_map(os.getenv("ONBOARDING_CLASS_ROLES"))
+# 年の選択肢 / 組の選択肢（カンマ区切りで上書き可）
+# 例: ONBOARDING_YEARS="1年,2年,3年"  ONBOARDING_CLASSES="1組,2組,3組,4組,5組,6組"
+def _parse_list(raw: str | None, default: list[str]) -> list[str]:
+    if not raw:
+        return default
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items if items else default
+
+ONBOARDING_YEARS: list[str] = _parse_list(os.getenv("ONBOARDING_YEARS"), ["1年", "2年", "3年"])
+ONBOARDING_CLASSES: list[str] = _parse_list(os.getenv("ONBOARDING_CLASSES"), [f"{i}組" for i in range(1, 8)])
+# 年組チャンネルで「自由入力メッセージ」を受け付けるか
+ONBOARDING_ALLOW_TEXT_INPUT: bool = os.getenv("ONBOARDING_ALLOW_TEXT_INPUT", "1").lower() not in ("0", "false", "no")
+# テキスト入力メッセージを何秒後に自動削除するか（0で削除しない）
+try:
+    ONBOARDING_AUTO_DELETE_SEC: int = int(os.getenv("ONBOARDING_AUTO_DELETE_SEC", "10"))
+except ValueError:
+    ONBOARDING_AUTO_DELETE_SEC = 10
+
 # 科目リスト（任意・ボタン/セレクトで出す）
 SUBJECTS: list[str] = ["数学", "英語", "理科", "社会", "国語", "情報", "その他"]

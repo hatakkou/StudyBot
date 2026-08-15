@@ -53,6 +53,12 @@ CREATE TABLE IF NOT EXISTS panel_message (
     channel_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS onboarding_panel (
+    guild_id INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL
+);
 """
 
 async def init_db():
@@ -277,4 +283,19 @@ async def get_panel(guild_id: int):
     async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM panel_message WHERE guild_id=?", (guild_id,)) as cur:
+            return await cur.fetchone()
+
+# ---------- onboarding ----------
+async def set_onboarding_panel(guild_id: int, channel_id: int, message_id: int):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO onboarding_panel (guild_id, channel_id, message_id) VALUES (?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, message_id=excluded.message_id",
+            (guild_id, channel_id, message_id),
+        )
+        await db.commit()
+
+async def get_onboarding_panel(guild_id: int):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM onboarding_panel WHERE guild_id=?", (guild_id,)) as cur:
             return await cur.fetchone()

@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("studybot")
 
 intents = discord.Intents.default()
-intents.message_content = False
+intents.message_content = True  # 年組チャンネルのテキスト入力検知に必要（onboarding）
 intents.voice_states = True
 intents.guilds = True
 intents.members = True
@@ -22,7 +22,7 @@ class StudyBot(commands.Bot):
 
     async def setup_hook(self):
         await init_db()
-        for ext in ("cogs.study", "cogs.stats", "cogs.pomodoro", "cogs.reminder", "cogs.bgm"):
+        for ext in ("cogs.study", "cogs.stats", "cogs.pomodoro", "cogs.reminder", "cogs.bgm", "cogs.onboarding"):
             try:
                 await self.load_extension(ext)
                 log.info("loaded %s", ext)
