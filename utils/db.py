@@ -291,6 +291,12 @@ async def get_all_panels():
         async with db.execute("SELECT * FROM panel_message") as cur:
             return await cur.fetchall()
 
+async def clear_panel(guild_id: int):
+    """指定ギルドのパネルレコードを削除する（メッセージ消失時のゴミ掃除用）"""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute("DELETE FROM panel_message WHERE guild_id=?", (guild_id,))
+        await db.commit()
+
 async def get_open_sessions_for_guild(guild_id: int):
     """ギルド内で現在進行中（ended_at IS NULL）の全セッションを返す"""
     async with aiosqlite.connect(config.DB_PATH) as db:

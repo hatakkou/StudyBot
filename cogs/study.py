@@ -90,6 +90,7 @@ class StudyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._board_lock = asyncio.Lock()
+        self._refresh_tasks: set[asyncio.Task] = set()
 
     async def cog_load(self):
         # 永続View登録（再起動してもボタンが生きる）
@@ -99,11 +100,14 @@ class StudyCog(commands.Cog):
             self._board_auto_refresh.start()
 
     async def cog_unload(self):
+        for task in list(self._refresh_tasks):
+            task.cancel()
+        self._refresh_tasks.clear()
         if self._board_auto_refresh.is_running():
             self._board_auto_refresh.cancel()
 
     # ---- ライブボード構築 ----
-    async def _build_panel_embed(self, guild: discord.Guild, sessions=None) -> discord.Embed:
+    async def _build_panel_embed(self, guild: discord.Guild, sessions: list | None = None) -> discord.Embed:
         """現在のセッション一覧を埋め込んだパネルEmbedを生成"""
         if sessions is None:
             try:
@@ -136,9 +140,14 @@ class StudyCog(commands.Cog):
                 inline=False,
             )
         else:
-            # ユーザー名 + 状態を常に表示
+            # ユーザー名 + 状態を常に表示（Discordのフィールド値は1024文字制限）
             lines: list[str] = []
-            for sess in sessions[:_BOARD_MAX_LINES]:
+            overflow_line: str | None = None
+            if len(sessions) > _BOARD_MAX_LINES:
+                overflow_line = f"… 他 {len(sessions) - _BOARD_MAX_LINES} 人"
+            for sess in sessions:
+                if len(lines) >= _BOARD_MAX_LINES:
+                    break
                 uid = sess["user_id"]
                 member = guild.get_member(uid)
                 if member:
@@ -161,16 +170,64 @@ class StudyCog(commands.Cog):
                     state = "🟢 勉強中"
                 # 経過（休憩除外）
                 dur = format_duration(eff)
-                lines.append(f"• {name_part} — **{state}** ｜ {subject} ｜ {dur} (開始 {started:%H:%M})")
+                candidate = f"• {name_part} — **{state}** ｜ {subject} ｜ {dur} (開始 {started:%H:%M})"
+                # 1024文字制限を超過しないか検証（overflow表示も考慮）
+                test_lines = lines + [candidate]
+                if overflow_line:
+                    test_value = "\n".join(test_lines + [overflow_line])
+                else:
+                    # まだoverflow未確定だが、残り人数がある場合はoverflowを想定
+                    remaining = len(sessions) - len(test_lines)
+                    if remaining > 0 and len(test_lines) >= _BOARD_MAX_LINES:
+                        test_value = "\n".join(test_lines + [f"… 他 {remaining} 人"])
+                    else:
+                        test_value = "\n".join(test_lines)
+                if len(test_value) > 1024:
+                    # overflowを入れても収まらない場合はoverflowを付けて打ち止め
+                    if overflow_line and len("\n".join(lines + [overflow_line])) <= 1024:
+                        # 既にoverflowがあればそれで打ち止め
+                        break
+                    # overflow無しでも超過なら追加せず打ち止め
+                    break
+                lines.append(candidate)
 
-            if len(sessions) > _BOARD_MAX_LINES:
-                lines.append(f"… 他 {len(sessions) - _BOARD_MAX_LINES} 人")
+            # overflow調整: 1024に収まるか再チェック
+            if overflow_line:
+                if len("\n".join(lines + [overflow_line])) > 1024:
+                    # overflowが入らないほど逼迫していたら最後の1行を削ってoverflowを優先
+                    while lines and len("\n".join(lines + [overflow_line])) > 1024:
+                        lines.pop()
+                # 実際に表示する人数差分がlines未表示分と一致するか再計算
+                if len(lines) < len(sessions):
+                    overflow_line = f"… 他 {len(sessions) - len(lines)} 人"
+                    # 再度1024チェック
+                    while lines and len("\n".join(lines + [overflow_line])) > 1024:
+                        lines.pop()
+                        overflow_line = f"… 他 {len(sessions) - len(lines)} 人"
+                    lines.append(overflow_line)
+            else:
+                # _BOARD_MAX_LINES未満でも1024で打ち切られた場合のoverflow
+                if len(lines) < len(sessions):
+                    overflow_line = f"… 他 {len(sessions) - len(lines)} 人"
+                    if len("\n".join(lines + [overflow_line])) <= 1024:
+                        lines.append(overflow_line)
+                    else:
+                        # overflowも入らない場合は最後の行を削る
+                        while lines and len("\n".join(lines + [overflow_line])) > 1024:
+                            lines.pop()
+                            overflow_line = f"… 他 {len(sessions) - len(lines)} 人"
+                        if len("\n".join(lines + [overflow_line])) <= 1024:
+                            lines.append(overflow_line)
 
             # 人数ヘッダ
             studying = sum(1 for s in sessions if not s["is_paused"])
             pausing = len(sessions) - studying
             header = f"📊 現在の勉強状況 — {len(sessions)}人 (勉強中 {studying} / 休憩中 {pausing})"
-            embed.add_field(name=header, value="\n".join(lines), inline=False)
+            field_value = "\n".join(lines) if lines else "表示できるセッションがありません。"
+            # 最終安全策: 1024を超過していたら切り詰め
+            if len(field_value) > 1024:
+                field_value = field_value[:1021] + "…"
+            embed.add_field(name=header, value=field_value, inline=False)
 
         embed.set_footer(text=f"最終更新: {now_jst():%Y/%m/%d %H:%M:%S} JST ｜ 自動更新 { _BOARD_REFRESH_SEC }秒ごと")
         return embed
@@ -203,6 +260,10 @@ class StudyCog(commands.Cog):
                     msg = await channel.fetch_message(msg_id)  # type: ignore
                 except discord.NotFound:
                     log.warning("パネルメッセージが見つからない guild=%s ch=%s msg=%s", guild_id, ch_id, msg_id)
+                    try:
+                        await db.clear_panel(guild_id)
+                    except Exception as e:
+                        log.debug("clear_panel失敗 guild=%s: %s", guild_id, e)
                     return
                 except discord.Forbidden:
                     log.warning("パネルメッセージ取得権限なし guild=%s ch=%s", guild_id, ch_id)
@@ -230,21 +291,37 @@ class StudyCog(commands.Cog):
             log.debug("定期更新: パネル一覧取得失敗: %s", e)
             return
         for p in panels:
-            gid = p["guild_id"]
             try:
+                gid = p["guild_id"]
                 await self.refresh_panel(gid)
                 # レート制限配慮で少し待つ
                 await asyncio.sleep(0.8)
             except Exception as e:
-                log.debug("定期更新失敗 guild=%s: %s", gid, e)
+                # guild_id取得失敗も含めて個別に処理
+                try:
+                    gid_str = p["guild_id"] if "guild_id" in p else "unknown"  # type: ignore
+                except Exception:
+                    gid_str = "unknown"
+                log.debug("定期更新失敗 guild=%s: %s", gid_str, e)
 
     @_board_auto_refresh.before_loop
     async def _before_board_loop(self):
         await self.bot.wait_until_ready()
 
+    @_board_auto_refresh.error
+    async def _board_auto_refresh_error(self, exc: BaseException):
+        log.error("定期更新ループで例外発生: %s", exc, exc_info=exc)
+        if not self._board_auto_refresh.is_running():
+            try:
+                self._board_auto_refresh.start()
+            except Exception as e:
+                log.debug("定期更新ループ再起動失敗: %s", e)
+
     def _schedule_refresh(self, guild_id: int):
         """状態変化後に即時ボード更新をスケジュール（ブロックしない）"""
-        asyncio.create_task(self.refresh_panel(guild_id))
+        task = asyncio.create_task(self.refresh_panel(guild_id))
+        self._refresh_tasks.add(task)
+        task.add_done_callback(self._refresh_tasks.discard)
 
     # ---- 通知ヘルパー: テキストチャンネルにメンションを送って10秒後に自動削除 ----
     async def _notify_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
@@ -457,6 +534,7 @@ class StudyCog(commands.Cog):
         if not interaction.guild:
             await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         # ライブ埋め込みを先に生成（既存セッションがあれば即反映）
         embed = await self._build_panel_embed(interaction.guild)
         view = StudyPanelView(self)
@@ -466,7 +544,7 @@ class StudyCog(commands.Cog):
         # 403/50001 はほぼ「Botがそのチャンネルで View Channel / Send Messages を持っていない」が原因
         try:
             if channel is None:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "チャンネル情報が取得できませんでした。テキストチャンネル内で実行してください。",
                     ephemeral=True,
                 )
@@ -491,7 +569,7 @@ class StudyCog(commands.Cog):
                         missing.append("埋め込みリンク")
                     # View Channel / Send Messages が無い場合は channel.send は必ず 403 になるので先に教える
                     if missing:
-                        await interaction.response.send_message(
+                        await interaction.followup.send(
                             f"❌ Botに権限が足りないためパネルを設置できません: **{' / '.join(missing)}**\n"
                             f"対象チャンネル: {channel.mention if hasattr(channel, 'mention') else channel}\n\n"
                             "**直し方**\n"
@@ -508,6 +586,7 @@ class StudyCog(commands.Cog):
             # 既存パネルがあれば古いメッセージを削除して二重表示を防ぐ
             try:
                 old = await db.get_panel(interaction.guild.id)
+                old_msg_id = None
                 if old is not None:
                     old_ch_id = old["channel_id"]
                     old_msg_id = old["message_id"]
@@ -525,34 +604,34 @@ class StudyCog(commands.Cog):
                         log.warning("旧パネル削除権限なし guild=%s ch=%s", interaction.guild.id, old_ch_id)
                     except Exception as e:
                         log.debug("旧パネル削除失敗: %s", e)
-                    # 同一チャンネル内の取り残されたパネル重複も掃除（直近50件）
-                    try:
-                        ch_for_scan = self.bot.get_channel(channel.id) or await self.bot.fetch_channel(channel.id)  # type: ignore
-                        if hasattr(ch_for_scan, "history"):
-                            async for m in ch_for_scan.history(limit=50):  # type: ignore
-                                if m.author.id != self.bot.user.id:  # type: ignore
-                                    continue
-                                if not m.embeds:
-                                    continue
-                                # パネルEmbedのタイトルで判定
-                                if m.embeds[0].title and "勉強パネル" in m.embeds[0].title:
-                                    # これから送るメッセージ以外で、旧IDでもない重複があれば削除
-                                    if m.id != old_msg_id:
-                                        try:
-                                            await m.delete()
-                                            log.info("重複パネルを削除 guild=%s msg=%s", interaction.guild.id, m.id)
-                                        except Exception:
-                                            pass
-                                        await asyncio.sleep(0.3)
-                    except Exception as e:
-                        log.debug("重複スキャン失敗: %s", e)
+                # 同一チャンネル内の取り残されたパネル重複も掃除（直近50件） — old有無に関わらず実行
+                try:
+                    ch_for_scan = self.bot.get_channel(channel.id) or await self.bot.fetch_channel(channel.id)  # type: ignore
+                    if hasattr(ch_for_scan, "history"):
+                        async for m in ch_for_scan.history(limit=50):  # type: ignore
+                            if m.author.id != self.bot.user.id:  # type: ignore
+                                continue
+                            if not m.embeds:
+                                continue
+                            # パネルEmbedのタイトルで判定
+                            if m.embeds[0].title and "勉強パネル" in m.embeds[0].title:
+                                # これから送るメッセージ以外で、旧IDでもない重複があれば削除
+                                if m.id != old_msg_id:
+                                    try:
+                                        await m.delete()
+                                        log.info("重複パネルを削除 guild=%s msg=%s", interaction.guild.id, m.id)
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    log.debug("重複スキャン失敗: %s", e)
             except Exception as e:
                 log.debug("旧パネル事前削除失敗: %s", e)
 
             # 本命: チャンネルに常設メッセージとして送る（従来どおり）
             msg = await channel.send(embed=embed, view=view)  # type: ignore[union-attr]
             await db.set_panel(interaction.guild.id, channel.id, msg.id)  # type: ignore
-            await interaction.response.send_message("パネルを設置しました。ライブボードは自動で更新されます。（旧パネルは自動削除済み）", ephemeral=True)
+            await interaction.followup.send("パネルを設置しました。ライブボードは自動で更新されます。（旧パネルは自動削除済み）", ephemeral=True)
             return
 
         except discord.Forbidden as e:
@@ -568,36 +647,22 @@ class StudyCog(commands.Cog):
                 "4. チャンネルを間違えていませんか？（VCのテキストチャットや権限が絞られたチャンネルで実行していませんか？）\n"
                 "権限を付与してから `/study_panel` を再実行してください。\n"
             )
-            # フォールバック: interaction応答として送る方法は webhook経由なので channel.send より通りやすいことがある
+            # フォールバック: defer後は followup 経由でパネルを公開
             try:
-                if not interaction.response.is_done():
-                    # フォールバックを試す: 応答自体をパネルにする
-                    await interaction.response.send_message(embed=embed, view=view)
-                    try:
-                        orig = await interaction.original_response()
-                        await db.set_panel(interaction.guild.id, orig.channel.id, orig.id)  # type: ignore
-                    except Exception:
-                        pass
-                    # 追加で ephemeral で案内
-                    await interaction.followup.send(detail + "\n※ フォールバックで応答メッセージとしてパネルを設置しました。", ephemeral=True)
-                else:
-                    await interaction.followup.send(detail, ephemeral=True)
-            except discord.Forbidden:
-                # フォールバックもダメならエラーのみを ephemeral で返す
+                fb_msg = await interaction.followup.send(embed=embed, view=view)
                 try:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(detail, ephemeral=True)
-                    else:
-                        await interaction.followup.send(detail, ephemeral=True)
+                    await db.set_panel(interaction.guild.id, fb_msg.channel.id, fb_msg.id)  # type: ignore
+                except Exception:
+                    pass
+                await interaction.followup.send(detail + "\n※ フォールバックで応答メッセージとしてパネルを設置しました。", ephemeral=True)
+            except discord.Forbidden:
+                try:
+                    await interaction.followup.send(detail, ephemeral=True)
                 except Exception:
                     pass
             return
         except discord.HTTPException as e:
-            msg = f"パネル送信に失敗しました: `{e}`"
-            if not interaction.response.is_done():
-                await interaction.response.send_message(msg, ephemeral=True)
-            else:
-                await interaction.followup.send(msg, ephemeral=True)
+            await interaction.followup.send(f"パネル送信に失敗しました: `{e}`", ephemeral=True)
             return
 
     @app_commands.command(name="study_board_refresh", description="ライブボードを手動で更新する（管理者）")
@@ -617,7 +682,7 @@ class StudyCog(commands.Cog):
         if not interaction.guild:
             await interaction.response.send_message("サーバー内で使ってください。", ephemeral=True)
             return
-        if not isinstance(interaction.channel, discord.TextChannel | discord.Thread | discord.VoiceChannel):  # type: ignore
+        if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
             await interaction.response.send_message("テキストチャンネルで実行してください。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
@@ -625,6 +690,7 @@ class StudyCog(commands.Cog):
         keep_id = panel["message_id"] if panel else None
         channel = interaction.channel  # type: ignore
         deleted = 0
+        forbidden_count = 0
         try:
             async for m in channel.history(limit=100):  # type: ignore
                 if m.author.id != self.bot.user.id:  # type: ignore
@@ -636,16 +702,20 @@ class StudyCog(commands.Cog):
                 try:
                     await m.delete()
                     deleted += 1
-                    await asyncio.sleep(0.4)
+                except discord.Forbidden:
+                    forbidden_count += 1
+                    log.warning("重複パネル削除権限なし guild=%s msg=%s", interaction.guild.id, m.id)
                 except Exception:
                     pass
+                finally:
+                    await asyncio.sleep(0.4)
         except Exception as e:
             await interaction.followup.send(f"スキャン失敗: {e}", ephemeral=True)
             return
-        await interaction.followup.send(
-            f"クリーンアップ完了: {deleted}件の重複パネルを削除しました。" + ("" if keep_id else "（DBにパネルが無いため全て削除対象でした）"),
-            ephemeral=True,
-        )
+        msg = f"クリーンアップ完了: {deleted}件の重複パネルを削除しました。" + ("" if keep_id else "（DBにパネルが無いため全て削除対象でした）")
+        if forbidden_count:
+            msg += f"（権限不足で {forbidden_count}件削除できませんでした）"
+        await interaction.followup.send(msg, ephemeral=True)
 
     # ---- VC自動検知: 入退室 + ミュート連動 ----
     @commands.Cog.listener()
