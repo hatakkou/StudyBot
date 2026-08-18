@@ -126,6 +126,103 @@ def _member_current_labels(member: discord.Member) -> tuple[list[str], list[str]
     return years, klasses
 
 
+# ---- ニックネーム（年組2桁を先頭に） ----
+_prefix_re = re.compile(r"^\s*[0-9０-９]{2,3}\s*")
+
+
+def _label_to_number(label: str) -> str | None:
+    m = re.search(r"(\d+)", _normalize_digits(label))
+    return m.group(1) if m else None
+
+
+def _strip_nenkumi_prefix(name: str) -> str:
+    """先頭の2桁（年組）プレフィックスを除去。例: '23 田中' -> '田中'"""
+    return _prefix_re.sub("", name, count=1).lstrip()
+
+
+async def _maybe_update_nickname(
+    member: discord.Member,
+    year_label: str | None,
+    class_label: str | None,
+) -> str | None:
+    """年組が両方揃っていればニックネーム先頭を '年組2桁 名前' に更新。戻り値は追記用メッセージ or None。"""
+    if not config.ONBOARDING_SET_NICKNAME:
+        return None
+    # 権限・ヒエラルキー事前チェックは edit 時の例外で拾うが、早期に分かるものはスキップ
+    guild = member.guild
+    if member.id == guild.owner_id:
+        log.info("nickname skip: target is owner %s", member.id)
+        return "（オーナーのためニックネームは変更できません）"
+
+    # 有効な年/組を決定（付与直後の roles から取得。部分更新でも既存の片方が補完される）
+    years, klasses = _member_current_labels(member)
+    eff_year = years[0] if years else year_label
+    eff_class = klasses[0] if klasses else class_label
+    # year_label/class_label が今回指定されたものなら優先（_member_current_labels がまだ反映されていない場合の保険）
+    if year_label:
+        eff_year = year_label
+    if class_label:
+        eff_class = class_label
+    # 再度 roles から補完: 片方だけ指定された場合に既存rolesを活かす
+    if not eff_year and years:
+        eff_year = years[0]
+    if not eff_class and klasses:
+        eff_class = klasses[0]
+    # 典型ケース: 両方揃っていないならまだ付けない
+    if not eff_year or not eff_class:
+        return None
+    y_num = _label_to_number(eff_year)
+    k_num = _label_to_number(eff_class)
+    if not y_num or not k_num:
+        return None
+    prefix = f"{y_num}{k_num}"
+    sep = config.ONBOARDING_NICKNAME_SEPARATOR
+
+    # ベース名決定（既存prefixを剥がしたもの）
+    current_display = member.display_name
+    base = _strip_nenkumi_prefix(current_display)
+    if not base.strip():
+        # display_name が "23" だけ等だった場合のフォールバック
+        base = member.global_name or member.name
+        base = _strip_nenkumi_prefix(base)
+        if not base.strip():
+            base = member.name
+    new_nick = f"{prefix}{sep}{base}"
+    # Discord ニックネーム上限 32文字
+    if len(new_nick) > 32:
+        max_base = 32 - len(prefix) - len(sep)
+        if max_base < 1:
+            max_base = 1
+        base = base[:max_base].rstrip()
+        new_nick = f"{prefix}{sep}{base}"
+    # 既に同じなら何もしない
+    if member.nick == new_nick or (member.nick is None and current_display == new_nick):
+        return f"（ニックネームは既に `{new_nick}` です）"
+    # Bot側権限チェック
+    me = guild.me
+    if me is None:
+        try:
+            me = await guild.fetch_member(guild._state.self_id)  # type: ignore[attr-defined]
+        except Exception:
+            me = None
+    if me is not None:
+        if not me.guild_permissions.manage_nicknames:
+            return "（Botに「ニックネームの管理」権限がないためニックネームは変更できませんでした）"
+        # ヒエラルキー: Botの最上位ロールが対象より上である必要
+        if member.top_role >= me.top_role and member.id != me.id:
+            return "（Botのロールが対象より下のためニックネームを変更できません。Botのロールを上げてください）"
+    try:
+        await member.edit(nick=new_nick, reason="年組登録: ニックネームに年組2桁を付与")
+        log.info("nickname updated: %s -> %s", current_display, new_nick)
+        return f"（ニックネームを `{new_nick}` に変更しました）"
+    except discord.Forbidden:
+        log.warning("nickname forbidden for %s", member.id)
+        return "（権限不足でニックネームを変更できませんでした。Botに「ニックネームの管理」権限があるか確認してください）"
+    except discord.HTTPException as e:
+        log.warning("nickname http error for %s: %s", member.id, e)
+        return f"（ニックネーム変更に失敗: {e}）"
+
+
 async def _apply_roles(
     member: discord.Member,
     year_label: str | None,
@@ -182,6 +279,14 @@ async def _apply_roles(
     if not_found:
         return False, "\n".join(not_found)
     if not to_add and not to_remove:
+        # ロール変更なしだが、ニックネームだけ更新できる場合がある（既に年組ロールを持っている等）
+        nick_msg = await _maybe_update_nickname(member, year_label, class_label)
+        if nick_msg is not None:
+            # ニックネームの結果を含めて成功として返す（ロールは既に持っている）
+            if "変更しました" in nick_msg or "既に" in nick_msg:
+                return True, f"年組は既に登録済みです {nick_msg}".strip()
+            # 権限不足などで変更できなかった場合も、ロール自体は保持している旨を伝える
+            return True, f"年組は既に登録済みです {nick_msg}".strip()
         return False, "変更するロールがありません。学年または組を選択してください。"
 
     # 実際に付与/剥奪
@@ -209,7 +314,16 @@ async def _apply_roles(
         parts.append(class_label)
     label_str = "・".join(parts) if parts else "—"
     removed_str = f"（{', '.join(r.name for r in to_remove)} を解除）" if to_remove else ""
-    return True, f"{label_str} を付与しました {removed_str}".strip()
+    base_msg = f"{label_str} を付与しました {removed_str}".strip()
+    # 年組2桁をニックネーム先頭に付与（例: 2年3組 → "23 名前"）
+    try:
+        nick_msg = await _maybe_update_nickname(member, year_label, class_label)
+    except Exception as e:
+        log.warning("nickname update error: %s", e)
+        nick_msg = None
+    if nick_msg:
+        base_msg = f"{base_msg} {nick_msg}"
+    return True, base_msg
 
 
 # ---- モーダル ----
@@ -323,16 +437,18 @@ class OnboardingPanelView(discord.ui.View):
 def _build_panel_embed(guild: discord.Guild) -> discord.Embed:
     years = ", ".join(config.ONBOARDING_YEARS)
     klasses = ", ".join(config.ONBOARDING_CLASSES)
+    nick_note = "（年組が揃うとニックネームの先頭に `23 名前` のように2桁が自動付与されます）\n" if config.ONBOARDING_SET_NICKNAME else ""
     desc = (
         "最初に **年組** を登録すると、対応するロールが自動で付きます。\n"
-        "このチャンネルで年組を登録してください。\n\n"
+        + nick_note
+        + "このチャンネルで年組を登録してください。\n\n"
         "**登録方法（どれでもOK）**\n"
         "• 下の **学年 / 組 セレクト** から選ぶ\n"
         "• **テキストで入力** ボタン → 例: `1年3組`\n"
         "• このチャンネルに直接メッセージで `1年3組` / `2-3` / `3組` と送る\n\n"
         f"学年: {years}\n"
         f"組: {klasses}\n\n"
-        "変更したいときはもう一度選び直せばOK（古い年/組ロールは自動で外れます）。\n"
+        "変更したいときはもう一度選び直せばOK（古い年/組ロールは自動で外れます／ニックネームの2桁も自動更新）。\n"
         "うまくいかない場合は管理者にロール名を確認してください。"
     )
     emb = discord.Embed(title="📝 年組登録パネル", description=desc, color=0x5865F2)

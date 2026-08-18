@@ -93,6 +93,13 @@ try:
     ONBOARDING_AUTO_DELETE_SEC: int = int(os.getenv("ONBOARDING_AUTO_DELETE_SEC", "10"))
 except ValueError:
     ONBOARDING_AUTO_DELETE_SEC = 10
+# 年組登録時にニックネーム先頭に「年組2桁」を付与するか（例: 2年3組 → "23 名前"）
+ONBOARDING_SET_NICKNAME: bool = os.getenv("ONBOARDING_SET_NICKNAME", "1").lower() not in ("0", "false", "no")
+# ニックネームの区切り文字（既定: 半角スペース）。クォートで囲まれていても剥がす
+_raw_sep = os.getenv("ONBOARDING_NICKNAME_SEPARATOR", " ")
+if _raw_sep is not None and len(_raw_sep) >= 2 and _raw_sep[0] == _raw_sep[-1] and _raw_sep[0] in ('"', "'"):
+    _raw_sep = _raw_sep[1:-1]
+ONBOARDING_NICKNAME_SEPARATOR: str = _raw_sep if _raw_sep is not None else " "
 
 # 科目リスト（任意・ボタン/セレクトで出す）
 SUBJECTS: list[str] = ["数学", "英語", "理科", "社会", "国語", "情報", "その他"]
