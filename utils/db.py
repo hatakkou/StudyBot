@@ -285,6 +285,22 @@ async def get_panel(guild_id: int):
         async with db.execute("SELECT * FROM panel_message WHERE guild_id=?", (guild_id,)) as cur:
             return await cur.fetchone()
 
+async def get_all_panels():
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM panel_message") as cur:
+            return await cur.fetchall()
+
+async def get_open_sessions_for_guild(guild_id: int):
+    """ギルド内で現在進行中（ended_at IS NULL）の全セッションを返す"""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM sessions WHERE guild_id=? AND ended_at IS NULL ORDER BY started_at ASC",
+            (guild_id,),
+        ) as cur:
+            return await cur.fetchall()
+
 # ---------- onboarding ----------
 async def set_onboarding_panel(guild_id: int, channel_id: int, message_id: int):
     async with aiosqlite.connect(config.DB_PATH) as db:
