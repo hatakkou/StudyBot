@@ -14,8 +14,7 @@ HELP = (
     "BGMをVCで流すには、サーバーに **FFmpeg** と Python パッケージ **PyNaCl** が必要です。\n"
     "- `/bgm_play url:<YouTube等のURL>` : yt-dlp があれば YouTube/SoundCloud 等から音声を抽出して再生（無ければ直URLのみ）\n"
     "- `/bgm_brownnoise` : 同梱の `audio/brownnoise.mp3` をループ再生\n"
-    "- `/bgm_stop` : 停止してVCから退出\n"
-    "FFmpeg は `ffmpeg -version` で確認、PyNaCl は `pip install PyNaCl`、yt-dlp は `pip install yt-dlp` で導入できます。"
+    "- `/bgm_stop` : 停止してVCから退出"
 )
 
 # brownnoise 探索候補（優先順）
